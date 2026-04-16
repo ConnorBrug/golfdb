@@ -12,25 +12,23 @@ class EventDetector(nn.Module):
         self.bidirectional = bidirectional
         self.dropout = dropout
 
-        # MobileNetV3-Large backbone via timm (replaces MobileNetV2)
-        # num_classes=0 removes classifier, global_pool='avg' returns pooled 1280-dim features
-        # drop_rate=0.0 disables timm's internal dropout so it doesn't interfere with training
+        # MobileNetV3-Large backbone via timm
         self.cnn = timm.create_model('mobilenetv3_large_100', pretrained=pretrain,
                                      num_classes=0, global_pool='avg', drop_rate=0.0)
 
-        # MobileNetV3-Large outputs 1280-dim features, same as V2
         self.rnn = nn.LSTM(1280, self.lstm_hidden, self.lstm_layers,
                            batch_first=True, bidirectional=bidirectional)
+
         if self.bidirectional:
             self.lin = nn.Linear(2 * self.lstm_hidden, 9)
         else:
             self.lin = nn.Linear(self.lstm_hidden, 9)
+
         if self.dropout:
             self.drop = nn.Dropout(0.5)
 
     def init_hidden(self, batch_size, device):
         num_dirs = 2 if self.bidirectional else 1
-        # hidden states are initial values, NOT learned parameters — no requires_grad
         h = torch.zeros(num_dirs * self.lstm_layers, batch_size, self.lstm_hidden, device=device)
         c = torch.zeros(num_dirs * self.lstm_layers, batch_size, self.lstm_hidden, device=device)
         return (h, c)
@@ -39,16 +37,18 @@ class EventDetector(nn.Module):
         batch_size, timesteps, C, H, W = x.size()
         self.hidden = self.init_hidden(batch_size, x.device)
 
-        # CNN forward: extract 1280-dim features from each frame
+        # flatten batch and time dims for the CNN
         c_in = x.view(batch_size * timesteps, C, H, W)
-        c_out = self.cnn(c_in)  # (batch*timesteps, 1280) — already pooled
+        # channels-last format on the rank-4 tensor, speeds up depthwise convs on Ampere+
+        c_in = c_in.contiguous(memory_format=torch.channels_last)
+        c_out = self.cnn(c_in)
+
         if self.dropout:
             c_out = self.drop(c_out)
 
-        # LSTM forward
+        # back to rank 3 for the LSTM
         r_in = c_out.view(batch_size, timesteps, -1)
         r_out, states = self.rnn(r_in, self.hidden)
         out = self.lin(r_out)
         out = out.view(batch_size * timesteps, 9)
-
         return out
