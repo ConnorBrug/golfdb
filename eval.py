@@ -1,117 +1,134 @@
-from model import EventDetector
-import torch
-import torch.backends.cudnn as cudnn
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from dataloader import GolfDB, ToTensor, Normalize
-import torch.nn.functional as F
-import numpy as np
-from util import correct_preds
-from sklearn.metrics import accuracy_score, f1_score
+import argparse
 import glob
 import os
 
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, f1_score
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from tqdm import tqdm
 
-def eval(model, split, seq_length, n_cpu, disp):
-    """Evaluate model on validation split.
-    Returns PCE, frame-level accuracy, and macro F1."""
-    dataset = GolfDB(data_file='data/val_split_{}.pkl'.format(split),
-                     vid_dir='data/videos_160/',
-                     seq_length=seq_length,
-                     transform=transforms.Compose([ToTensor(),
-                                                   Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]),
-                     train=False)
+from dataloader import GolfDB, ToTensor, Normalize
+from model import EventDetector
+from util import correct_preds
 
-    data_loader = DataLoader(dataset,
-                             batch_size=1,
-                             shuffle=False,
-                             num_workers=n_cpu,
-                             drop_last=False)
+
+def evaluate_checkpoint(ckpt_path, split, seq_length, num_workers, vid_dir, disp=False):
+    dataset = GolfDB(
+        data_file=f'data/val_split_{split}.pkl',
+        vid_dir=vid_dir,
+        seq_length=seq_length,
+        transform=transforms.Compose([
+            ToTensor(),
+            Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]),
+        train=False,
+    )
+
+    loader_kwargs = dict(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+        pin_memory=True,
+    )
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = 2
+
+    data_loader = DataLoader(**loader_kwargs)
+
+    model = EventDetector(
+        pretrain=False,  # never redownload weights in eval
+        width_mult=1.0,
+        lstm_layers=1,
+        lstm_hidden=256,
+        bidirectional=True,
+        dropout=False,
+        cnn_dropout=0.0,
+        checkpoint_backbone=False,
+    )
+
+    save_dict = torch.load(ckpt_path, map_location='cpu')
+    model.load_state_dict(save_dict['model_state_dict'])
+    model.cuda()
+    model.eval()
 
     correct = []
     all_preds = []
     all_labels = []
 
     with torch.no_grad():
-        for i, sample in enumerate(data_loader):
+        for idx, sample in enumerate(tqdm(data_loader, desc=os.path.basename(ckpt_path), leave=False)):
             images, labels = sample['images'], sample['labels']
-            # full samples do not fit into GPU memory so evaluate sample in 'seq_length' batches
+
             batch = 0
+            probs = []
             while batch * seq_length < images.shape[1]:
-                if (batch + 1) * seq_length > images.shape[1]:
-                    image_batch = images[:, batch * seq_length:, :, :, :]
-                else:
-                    image_batch = images[:, batch * seq_length:(batch + 1) * seq_length, :, :, :]
-                logits = model(image_batch.cuda())
-                if batch == 0:
-                    probs = F.softmax(logits.data, dim=1).cpu().numpy()
-                else:
-                    probs = np.append(probs, F.softmax(logits.data, dim=1).cpu().numpy(), 0)
+                start = batch * seq_length
+                end = min((batch + 1) * seq_length, images.shape[1])
+                image_batch = images[:, start:end, :, :, :].cuda(non_blocking=True)
+
+                logits = model(image_batch)
+                probs.append(F.softmax(logits, dim=1).cpu().numpy())
                 batch += 1
 
-            # PCE (event-level metric from the paper)
-            _, _, _, _, c = correct_preds(probs, labels.squeeze())
+            probs = np.concatenate(probs, axis=0)
+
+            _, _, _, _, c = correct_preds(probs, labels.squeeze().numpy())
             if disp:
-                print(i, c)
+                print(idx, c)
             correct.append(c)
 
-            # frame-level predictions for accuracy and F1
             frame_preds = np.argmax(probs, axis=1)
             frame_labels = labels.squeeze().numpy()
             all_preds.extend(frame_preds.tolist())
             all_labels.extend(frame_labels.tolist())
 
-    PCE = np.mean(correct)
+    pce = np.mean(correct)
     accuracy = accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+    return pce, accuracy, macro_f1
 
-    return PCE, accuracy, macro_f1
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('model_dir', nargs='?', default='models')
+    parser.add_argument('--split', type=int, default=1)
+    parser.add_argument('--seq-length', type=int, default=64)
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--vid-dir', type=str, default='data/videos_160/')
+    args = parser.parse_args()
 
-if __name__ == '__main__':
-
-    import sys
-    split = 1
-    seq_length = 64
-    n_cpu = 0
-
-    cudnn.benchmark = True
-
-    # optionally pass a models folder as argument: python eval.py models_k5_augmented
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else 'models'
-
-    # find all checkpoints and evaluate each one
-    checkpoints = sorted(glob.glob(os.path.join(model_dir, 'swingnet_*.pth.tar')))
+    checkpoints = sorted(glob.glob(os.path.join(args.model_dir, 'swingnet_*.pth.tar')))
     if not checkpoints:
-        print('No checkpoints found in models/')
-        exit()
+        print(f'No checkpoints found in {args.model_dir}/')
+        return
 
     print(f'Found {len(checkpoints)} checkpoints. Evaluating all...\n')
 
-    best_pce = 0.0
+    best_pce = -1.0
     best_ckpt = ''
     best_acc = 0.0
     best_f1 = 0.0
 
     for ckpt_path in checkpoints:
-        model = EventDetector(pretrain=True,
-                              width_mult=1.,
-                              lstm_layers=1,
-                              lstm_hidden=256,
-                              bidirectional=True,
-                              dropout=False)
-
-        save_dict = torch.load(ckpt_path, map_location='cpu')
-        model.load_state_dict(save_dict['model_state_dict'])
-        model.cuda()
-        model.eval()
-
-        PCE, acc, f1 = eval(model, split, seq_length, n_cpu, False)
+        pce, acc, f1 = evaluate_checkpoint(
+            ckpt_path,
+            split=args.split,
+            seq_length=args.seq_length,
+            num_workers=args.num_workers,
+            vid_dir=args.vid_dir,
+            disp=False,
+        )
         ckpt_name = os.path.basename(ckpt_path)
-        print(f'{ckpt_name}: PCE = {PCE:.4f}  Accuracy = {acc:.4f}  Macro F1 = {f1:.4f}')
+        print(f'{ckpt_name}: PCE = {pce:.4f}  Accuracy = {acc:.4f}  Macro F1 = {f1:.4f}')
 
-        if PCE > best_pce:
-            best_pce = PCE
+        if pce > best_pce:
+            best_pce = pce
             best_ckpt = ckpt_name
             best_acc = acc
             best_f1 = f1
@@ -120,4 +137,8 @@ if __name__ == '__main__':
     print(f'  PCE:       {best_pce:.4f}')
     print(f'  Accuracy:  {best_acc:.4f}')
     print(f'  Macro F1:  {best_f1:.4f}')
-    print(f'\nPaper baseline (MobileNetV2): PCE = 0.7610')
+    print('\nPaper baseline (MobileNetV2): PCE = 0.7610')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,122 +1,181 @@
-from dataloader import GolfDB, Normalize, ToTensor, RandomHorizontalFlip, ColorJitter, RandomRotation
-from model import EventDetector
-from util import *
+import argparse
+import glob
+import math
+import os
+import random
+
+import cv2
+import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torchvision import transforms
 from tqdm import tqdm
-import math
-import os
-import glob
-import sys
+
+from dataloader import GolfDB, Normalize, ToTensor, RandomHorizontalFlip, ColorJitter, RandomRotation
+from model import EventDetector
+from util import AverageMeter, freeze_layers
 
 
-if __name__ == '__main__':
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    # training configuration
-    split = 1
-    iterations = 6000   # tuned for best accuracy/time tradeoff at bs=36
-    it_save = 100
-    n_cpu = 0
-    seq_length = 64
-    bs = 36             # fits entirely in 16GB VRAM, no DDR5 spillover
-    k = 0               # full fine-tuning
 
-    # linear scaling rule: bs=36 is ~1.64x original bs=22, so lr ~1.64x original 0.0005
-    lr_init = 0.00082
-    lr_min = 1e-6
+def seed_worker(worker_id):
+    # Avoid thread oversubscription from OpenCV inside multiple workers.
+    cv2.setNumThreads(0)
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
-    # performance flags
+
+def build_loader(args):
+    train_transforms = transforms.Compose([
+        RandomHorizontalFlip(p=0.5),
+        ColorJitter(brightness=0.20, contrast=0.20, saturation=0.15),
+        RandomRotation(degrees=5),
+        ToTensor(),
+        Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    dataset = GolfDB(
+        data_file=f'data/train_split_{args.split}.pkl',
+        vid_dir=args.vid_dir,
+        seq_length=args.seq_length,
+        transform=train_transforms,
+        train=True,
+    )
+
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        drop_last=True,
+        pin_memory=True,
+        worker_init_fn=seed_worker,
+    )
+
+    if args.num_workers > 0:
+        kwargs['persistent_workers'] = True
+        kwargs['prefetch_factor'] = 2
+
+    return DataLoader(**kwargs)
+
+
+def build_model(args):
+    model = EventDetector(
+        pretrain=True,
+        width_mult=1.0,
+        lstm_layers=1,
+        lstm_hidden=256,
+        bidirectional=True,
+        dropout=False,
+        cnn_dropout=0.0,
+        checkpoint_backbone=args.grad_ckpt,
+    )
+    freeze_layers(args.k, model)
+    model = model.cuda()
+    model.train()
+    return model
+
+
+def save_ckpt(path, model, optimizer, scaler, iteration, args):
+    torch.save({
+        'iteration': iteration,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'args': vars(args),
+    }, path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--split', type=int, default=1)
+    parser.add_argument('--iterations', type=int, default=6000)
+    parser.add_argument('--save-every', type=int, default=100)
+    parser.add_argument('--seq-length', type=int, default=64)
+    parser.add_argument('--batch-size', type=int, default=36)
+    parser.add_argument('--num-workers', type=int, default=8)
+    parser.add_argument('--k', type=int, default=5, help='number of backbone layers to freeze')
+    parser.add_argument('--lr', type=float, default=8.2e-4)
+    parser.add_argument('--lr-min', type=float, default=1e-6)
+    parser.add_argument('--weight-decay', type=float, default=1e-4)
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--vid-dir', type=str, default='data/videos_160/')
+    parser.add_argument('--model-dir', type=str, default='models')
+    parser.add_argument('--resume', action='store_true')
+    parser.add_argument('--grad-ckpt', action='store_true',
+                        help='Enable CNN activation checkpointing. Slower but lower VRAM.')
+    args = parser.parse_args()
+
+    seed_everything(args.seed)
+
     cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
 
-    model = EventDetector(pretrain=True,
-                          width_mult=1.,
-                          lstm_layers=1,
-                          lstm_hidden=256,
-                          bidirectional=True,
-                          dropout=False)
-    freeze_layers(k, model)
-    model.train()
-    model.cuda()
+    model = build_model(args)
+    data_loader = build_loader(args)
 
-    # gradient checkpointing, trades recompute for much less activation memory
-    # this is what lets us fit bs=44 at k=0
-    model.cnn.set_grad_checkpointing(enable=True)
+    class_weights = torch.tensor([1/8] * 8 + [1/35], dtype=torch.float32, device='cuda')
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
-    # torch.compile is flaky on Windows (requires Triton/C++ toolchain), skipping
-    # the other optimizations (grad checkpointing, bs=44, channels-last, TF32) give the bulk of the speedup anyway
-
-    # data augmentation
-    train_transforms = transforms.Compose([
-        RandomHorizontalFlip(p=0.5),
-        ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
-        RandomRotation(degrees=5),
-        ToTensor(),
-        Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-
-    dataset = GolfDB(data_file='data/train_split_{}.pkl'.format(split),
-                     vid_dir='data/videos_160/',
-                     seq_length=seq_length,
-                     transform=train_transforms,
-                     train=True)
-
-    data_loader = DataLoader(dataset,
-                             batch_size=bs,
-                             shuffle=True,
-                             num_workers=n_cpu,
-                             drop_last=True,
-                             pin_memory=True)
-
-    weights = torch.FloatTensor([1/8, 1/8, 1/8, 1/8, 1/8, 1/8, 1/8, 1/8, 1/35]).cuda()
-    criterion = torch.nn.CrossEntropyLoss(weight=weights)
-
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
-                                 lr=lr_init, weight_decay=1e-4)
-
-    scaler = GradScaler()
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    scaler = GradScaler('cuda')
     losses = AverageMeter()
 
-    if not os.path.exists('models'):
-        os.mkdir('models')
+    os.makedirs(args.model_dir, exist_ok=True)
 
-    # resume support, pass --resume flag to continue from latest checkpoint
-    # not used in this fresh run but kept for future
     start_iter = 0
-    existing = sorted(glob.glob('models/swingnet_*.pth.tar'))
-    if existing and '--resume' in sys.argv:
-        latest = max(existing, key=lambda p: int(os.path.basename(p).split('_')[1].split('.')[0]))
-        start_iter = int(os.path.basename(latest).split('_')[1].split('.')[0])
-        print(f'Resuming from {os.path.basename(latest)} (iteration {start_iter})')
-        ckpt = torch.load(latest)
-        model.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        model.train()
+    if args.resume:
+        existing = sorted(glob.glob(os.path.join(args.model_dir, 'swingnet_*.pth.tar')))
+        if existing:
+            latest = max(existing, key=lambda p: int(os.path.basename(p).split('_')[1].split('.')[0]))
+            ckpt = torch.load(latest, map_location='cpu')
+            model.load_state_dict(ckpt['model_state_dict'])
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if 'scaler_state_dict' in ckpt:
+                scaler.load_state_dict(ckpt['scaler_state_dict'])
+            start_iter = int(ckpt.get('iteration', 0))
+            model.train()
+            print(f'Resuming from {os.path.basename(latest)} (iteration {start_iter})')
 
+    # Helpful presets for your box:
+    #   Fast target (~1-2h if dataloader behaves): --k 5 --batch-size 36 --iterations 4600 --num-workers 8
+    #   Max target (longer):                       --k 0 --batch-size 28 --iterations 7000 --num-workers 8 --grad-ckpt
     i = start_iter
-    pbar = tqdm(total=iterations, initial=start_iter, desc='Training', unit='it')
-    while i < iterations:
+    pbar = tqdm(total=args.iterations, initial=start_iter, desc='Training', unit='it')
+
+    while i < args.iterations:
         for sample in data_loader:
-            lr = lr_min + 0.5 * (lr_init - lr_min) * (1 + math.cos(math.pi * i / iterations))
+            lr = args.lr_min + 0.5 * (args.lr - args.lr_min) * (1 + math.cos(math.pi * i / args.iterations))
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
 
             images = sample['images'].cuda(non_blocking=True)
             labels = sample['labels'].cuda(non_blocking=True)
 
-            with autocast(dtype=torch.float16):
+            with autocast('cuda', dtype=torch.float16):
                 logits = model(images)
-                labels = labels.view(bs * seq_length)
+                labels = labels.reshape(args.batch_size * args.seq_length)
                 loss = criterion(logits, labels)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
@@ -124,9 +183,18 @@ if __name__ == '__main__':
             pbar.set_postfix(loss=f'{losses.val:.4f}', avg=f'{losses.avg:.4f}', lr=f'{lr:.6f}')
             pbar.update(1)
             i += 1
-            if i % it_save == 0:
-                torch.save({'optimizer_state_dict': optimizer.state_dict(),
-                            'model_state_dict': model.state_dict()}, 'models/swingnet_{}.pth.tar'.format(i))
-            if i == iterations:
+
+            if i % args.save_every == 0:
+                save_ckpt(
+                    os.path.join(args.model_dir, f'swingnet_{i}.pth.tar'),
+                    model, optimizer, scaler, i, args
+                )
+
+            if i >= args.iterations:
                 break
+
     pbar.close()
+
+
+if __name__ == '__main__':
+    main()
