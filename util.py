@@ -40,14 +40,27 @@ def correct_preds(probs, labels, tol=-1):
 
 
 def freeze_layers(num_freeze, net):
-    # print("Freezing {:2d} layers".format(num_freeze))
-    i = 1
-    for child in net.children():
-        if i ==1:
-            j = 1
-            for child_child in child.children():
-                if j <= num_freeze:
-                    for param in child_child.parameters():
-                        param.requires_grad = False
-                j += 1
-        i += 1
+    """Freeze the first num_freeze layers of the MobileNetV3 backbone.
+
+    Layers are counted as: conv_stem, bn1, then each individual
+    InvertedResidual block flattened from the blocks Sequential.
+    This gives ~18 freezable layers, similar to MobileNetV2's structure.
+    Freezing 10 (the paper's default) covers the stem + first 8 blocks.
+    """
+    import torch.nn as nn
+    cnn = next(net.children())  # self.cnn (timm MobileNetV3 model)
+
+    # Build flat list: stem layers, then individual inverted-residual blocks
+    freezable = [cnn.conv_stem, cnn.bn1]
+    for stage in cnn.blocks:
+        if isinstance(stage, nn.Sequential):
+            for block in stage:
+                freezable.append(block)
+        else:
+            freezable.append(stage)
+
+    num_to_freeze = min(num_freeze, len(freezable))
+    for i in range(num_to_freeze):
+        for param in freezable[i].parameters():
+            param.requires_grad = False
+    print(f"Froze {num_to_freeze}/{len(freezable)} backbone layers")

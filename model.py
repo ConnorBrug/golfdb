@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
-from MobileNetV2 import MobileNetV2
+import timm
 
 
 class EventDetector(nn.Module):
@@ -13,38 +12,36 @@ class EventDetector(nn.Module):
         self.bidirectional = bidirectional
         self.dropout = dropout
 
-        net = MobileNetV2(width_mult=width_mult)
-        state_dict_mobilenet = torch.load('mobilenet_v2.pth.tar')
-        if pretrain:
-            net.load_state_dict(state_dict_mobilenet)
+        # MobileNetV3-Large backbone via timm (replaces MobileNetV2)
+        # num_classes=0 removes classifier, global_pool='avg' returns pooled 1280-dim features
+        # drop_rate=0.0 disables timm's internal dropout so it doesn't interfere with training
+        self.cnn = timm.create_model('mobilenetv3_large_100', pretrained=pretrain,
+                                     num_classes=0, global_pool='avg', drop_rate=0.0)
 
-        self.cnn = nn.Sequential(*list(net.children())[0][:19])
-        self.rnn = nn.LSTM(int(1280*width_mult if width_mult > 1.0 else 1280),
-                           self.lstm_hidden, self.lstm_layers,
+        # MobileNetV3-Large outputs 1280-dim features, same as V2
+        self.rnn = nn.LSTM(1280, self.lstm_hidden, self.lstm_layers,
                            batch_first=True, bidirectional=bidirectional)
         if self.bidirectional:
-            self.lin = nn.Linear(2*self.lstm_hidden, 9)
+            self.lin = nn.Linear(2 * self.lstm_hidden, 9)
         else:
             self.lin = nn.Linear(self.lstm_hidden, 9)
         if self.dropout:
             self.drop = nn.Dropout(0.5)
 
-    def init_hidden(self, batch_size):
-        if self.bidirectional:
-            return (Variable(torch.zeros(2*self.lstm_layers, batch_size, self.lstm_hidden).cuda(), requires_grad=True),
-                    Variable(torch.zeros(2*self.lstm_layers, batch_size, self.lstm_hidden).cuda(), requires_grad=True))
-        else:
-            return (Variable(torch.zeros(self.lstm_layers, batch_size, self.lstm_hidden).cuda(), requires_grad=True),
-                    Variable(torch.zeros(self.lstm_layers, batch_size, self.lstm_hidden).cuda(), requires_grad=True))
+    def init_hidden(self, batch_size, device):
+        num_dirs = 2 if self.bidirectional else 1
+        # hidden states are initial values, NOT learned parameters — no requires_grad
+        h = torch.zeros(num_dirs * self.lstm_layers, batch_size, self.lstm_hidden, device=device)
+        c = torch.zeros(num_dirs * self.lstm_layers, batch_size, self.lstm_hidden, device=device)
+        return (h, c)
 
     def forward(self, x, lengths=None):
         batch_size, timesteps, C, H, W = x.size()
-        self.hidden = self.init_hidden(batch_size)
+        self.hidden = self.init_hidden(batch_size, x.device)
 
-        # CNN forward
+        # CNN forward: extract 1280-dim features from each frame
         c_in = x.view(batch_size * timesteps, C, H, W)
-        c_out = self.cnn(c_in)
-        c_out = c_out.mean(3).mean(2)
+        c_out = self.cnn(c_in)  # (batch*timesteps, 1280) — already pooled
         if self.dropout:
             c_out = self.drop(c_out)
 
@@ -52,9 +49,6 @@ class EventDetector(nn.Module):
         r_in = c_out.view(batch_size, timesteps, -1)
         r_out, states = self.rnn(r_in, self.hidden)
         out = self.lin(r_out)
-        out = out.view(batch_size*timesteps,9)
+        out = out.view(batch_size * timesteps, 9)
 
         return out
-
-
-
