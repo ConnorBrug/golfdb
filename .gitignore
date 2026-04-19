@@ -10,6 +10,7 @@ __pycache__/
 
 # training outputs
 models_*
+logs/
 *.log
 split*_clean.txt
 split*_025952.txt

@@ -1,3 +1,20 @@
+"""Training loop for SwingNet.
+
+Features:
+  - bfloat16 autocast by default (fp16 via --fp16)
+  - Fused AdamW with four-group Layer-wise LR Decay (backbone vs head, weight decay
+    disabled on BN/bias/LSTM 1-D params)
+  - Cosine LR schedule with linear warmup
+  - Mixup (alpha=0.2, p=0.5), label smoothing (0.1), stochastic depth (0.1)
+  - EMA of model weights saved every --save-every iterations
+  - Deferred .item() loss sync to minimize CUDA stalls
+  - Resume from the latest non-EMA checkpoint with --resume
+
+Launch:
+  python train.py --split 1 --model-dir models_s1 --batch-size 16 \
+      --seq-length 64 --iterations 8000
+"""
+
 import argparse
 import glob
 import math

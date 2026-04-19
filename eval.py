@@ -1,3 +1,18 @@
+"""Checkpoint sweep evaluator.
+
+Walks every checkpoint in a given model directory, runs inference on the held-out
+split, and reports PCE (paper's metric), frame-level Accuracy, and Macro F1.
+
+Features:
+  - Optional horizontal-flip TTA (averages logits, softmax in fp32)
+  - --mode {all, ema, plain} to filter which checkpoints to evaluate
+  - --last-n N to only evaluate the tail
+  - bf16 autocast by default, --fp16 for fp16
+
+Typical use:
+  python eval.py models_s1 --split 1 --seq-length 64 --mode ema --tta
+"""
+
 import argparse
 import glob
 import os

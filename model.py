@@ -1,3 +1,10 @@
+"""Event detection model: MobileNetV3-Large CNN per frame + BiLSTM over time +
+linear head for 9 classes (8 swing events + no-event).
+
+Input: (B, T, 3, 160, 160) float tensor (normalized upstream in gpu_augment.py).
+Output: (B*T, 9) class logits.
+"""
+
 import torch
 import torch.nn as nn
 import timm

@@ -1,3 +1,6 @@
+"""Small utilities: running-average meter, PCE metric from the paper,
+and a helper to freeze N early blocks of the timm MobileNetV3 backbone."""
+
 import numpy as np
 
 
