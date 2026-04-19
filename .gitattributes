@@ -1,0 +1,16 @@
+# Force LF line endings for all text files so Windows checkouts do not
+# produce spurious "modified" entries. Anything not matched falls back to
+# git's default auto-detect.
+* text=auto eol=lf
+
+# Binary assets: never touch
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.mp4   binary
+*.pkl   binary
+*.mat   binary
+*.tar   binary
+*.pth   binary
