@@ -1,177 +1,122 @@
 import os.path as osp
 import cv2
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
 
+_FRAME_CACHE = {}
+
+
+def _preload_video(vid_dir, video_id):
+    """Decode an entire video into a uint8 (N, H, W, 3) numpy array and cache it."""
+    if video_id in _FRAME_CACHE:
+        return _FRAME_CACHE[video_id]
+
+    path = osp.join(vid_dir, f'{video_id}.mp4')
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f'Could not open video: {path}')
+
+    # preallocate from header frame count when available, write directly into the buffer
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 160
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 160
+
+    if n_frames > 0:
+        arr = np.empty((n_frames, h, w, 3), dtype=np.uint8)
+        i = 0
+        while i < n_frames:
+            ret, img = cap.read()
+            if not ret:
+                break
+            # write RGB directly into the preallocated slot, no intermediate alloc
+            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, dst=arr[i])
+            i += 1
+        cap.release()
+        if i == 0:
+            raise RuntimeError(f'Video has 0 frames: {path}')
+        if i < n_frames:
+            arr = arr[:i].copy()
+    else:
+        frames = []
+        while True:
+            ret, img = cap.read()
+            if not ret:
+                break
+            frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        cap.release()
+        if not frames:
+            raise RuntimeError(f'Video has 0 frames: {path}')
+        arr = np.stack(frames, axis=0)
+
+    _FRAME_CACHE[video_id] = arr
+    return arr
+
+
+def preload_all_videos(vid_dir, video_ids, verbose=True):
+    from tqdm import tqdm
+    iterator = tqdm(video_ids, desc='Preloading videos', unit='vid') if verbose else video_ids
+    total_bytes = 0
+    for vid in iterator:
+        arr = _preload_video(vid_dir, vid)
+        total_bytes += arr.nbytes
+    if verbose:
+        print(f'Cached {len(video_ids)} videos, {total_bytes / 1e9:.2f} GB in RAM')
+
+
 class GolfDB(Dataset):
-    def __init__(self, data_file, vid_dir, seq_length, transform=None, train=True):
+    """Workers only slice frames. All augmentation happens on GPU in train.py."""
+
+    def __init__(self, data_file, vid_dir, seq_length, train=True, preload=True):
         self.df = pd.read_pickle(data_file)
         self.vid_dir = vid_dir
         self.seq_length = seq_length
-        self.transform = transform
         self.train = train
+
+        if preload:
+            preload_all_videos(vid_dir, self.df['id'].tolist(), verbose=True)
 
     def __len__(self):
         return len(self.df)
 
-    def _open_video(self, video_id):
-        path = osp.join(self.vid_dir, f'{video_id}.mp4')
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            raise FileNotFoundError(f'Could not open video: {path}')
-        return cap, path
+    def _get_video(self, video_id):
+        if video_id in _FRAME_CACHE:
+            return _FRAME_CACHE[video_id]
+        return _preload_video(self.vid_dir, video_id)
 
     def __getitem__(self, idx):
         a = self.df.loc[idx, :]
-        events = a['events'].copy()
-        events -= events[0]  # align event frames to the trimmed clip
+        events = np.asarray(a['events'], dtype=np.int64)
+        events = events - events[0]
+        inner_events = events[1:-1]  # the 8 swing events we actually classify
 
-        cap, path = self._open_video(a['id'])
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if total_frames <= 0:
-            cap.release()
-            raise RuntimeError(f'Video has 0 frames or unreadable metadata: {path}')
+        frames = self._get_video(a['id'])
+        total_frames = frames.shape[0]
 
         if self.train:
-            images = np.empty((self.seq_length, 160, 160, 3), dtype=np.uint8)
-            labels = np.empty((self.seq_length,), dtype=np.int64)
-
+            # random start up to the last event, then walk forward seq_length frames wrapping at end
             start_frame = np.random.randint(events[-1] + 1)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-            pos = start_frame
-            n = 0
+            positions = (np.arange(self.seq_length, dtype=np.int64) + start_frame) % total_frames
 
-            while n < self.seq_length:
-                ret, img = cap.read()
-                if not ret:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    pos = 0
-                    continue
+            # vectorized gather, no Python per-frame loop
+            images = frames[positions]
 
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                images[n] = img
-
-                if pos in events[1:-1]:
-                    labels[n] = np.where(events[1:-1] == pos)[0][0]
-                else:
-                    labels[n] = 8
-
-                n += 1
-                pos += 1
-
-            cap.release()
+            labels = np.full(self.seq_length, 8, dtype=np.int64)
+            for evt_idx, evt_pos in enumerate(inner_events):
+                labels[positions == evt_pos] = evt_idx
         else:
-            images = np.empty((total_frames, 160, 160, 3), dtype=np.uint8)
-            labels = np.empty((total_frames,), dtype=np.int64)
+            # full-length eval: label defaults to no-event (8), stamp in the 8 event frames
+            images = frames
+            labels = np.full(total_frames, 8, dtype=np.int64)
+            for evt_idx, evt_pos in enumerate(inner_events):
+                if 0 <= evt_pos < total_frames:
+                    labels[evt_pos] = evt_idx
 
-            for pos in range(total_frames):
-                ret, img = cap.read()
-                if not ret:
-                    cap.release()
-                    raise RuntimeError(f'Failed reading frame {pos} from {path}')
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                images[pos] = img
-                if pos in events[1:-1]:
-                    labels[pos] = np.where(events[1:-1] == pos)[0][0]
-                else:
-                    labels[pos] = 8
-
-            cap.release()
-
-        sample = {'images': images, 'labels': labels}
-        if self.transform:
-            sample = self.transform(sample)
-        return sample
-
-
-# -----------------------------
-# Sequence-consistent transforms
-# -----------------------------
-
-class RandomHorizontalFlip:
-    """Flip all frames in a sequence together."""
-    def __init__(self, p=0.5):
-        self.p = p
-
-    def __call__(self, sample):
-        if np.random.random() < self.p:
-            sample['images'] = sample['images'][:, :, ::-1, :].copy()
-        return sample
-
-
-class ColorJitter:
-    """Apply the same color jitter to every frame in the sequence."""
-    def __init__(self, brightness=0.20, contrast=0.20, saturation=0.15):
-        self.brightness = brightness
-        self.contrast = contrast
-        self.saturation = saturation
-
-    def __call__(self, sample):
-        images = sample['images'].astype(np.float32)
-
-        if self.brightness > 0:
-            b = 1.0 + np.random.uniform(-self.brightness, self.brightness)
-            images *= b
-
-        if self.contrast > 0:
-            c = 1.0 + np.random.uniform(-self.contrast, self.contrast)
-            mean = images.mean(axis=(1, 2, 3), keepdims=True)
-            images = (images - mean) * c + mean
-
-        if self.saturation > 0:
-            s = 1.0 + np.random.uniform(-self.saturation, self.saturation)
-            gray = np.mean(images, axis=-1, keepdims=True)
-            images = gray + (images - gray) * s
-
-        sample['images'] = np.clip(images, 0, 255).astype(np.uint8)
-        return sample
-
-
-class RandomRotation:
-    """Rotate every frame in a sequence by the same small angle."""
-    def __init__(self, degrees=5):
-        self.degrees = degrees
-
-    def __call__(self, sample):
-        angle = np.random.uniform(-self.degrees, self.degrees)
-        if abs(angle) < 0.25:
-            return sample
-
-        images = sample['images']
-        h, w = images.shape[1], images.shape[2]
-        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-
-        sample['images'] = np.stack(
-            [cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-             for img in images],
-            axis=0
-        )
-        return sample
-
-
-# -----------------------------
-# Standard transforms
-# -----------------------------
-
-class ToTensor:
-    def __call__(self, sample):
-        images, labels = sample['images'], sample['labels']
-        images = images.transpose((0, 3, 1, 2))
+        # CHW uint8 contiguous for a fast pinned host-device copy
+        images = np.ascontiguousarray(images.transpose((0, 3, 1, 2)))
         return {
-            'images': torch.from_numpy(images).float().div(255.0),
-            'labels': torch.from_numpy(labels).long(),
+            'images': torch.from_numpy(images),
+            'labels': torch.from_numpy(labels),
         }
-
-
-class Normalize:
-    def __init__(self, mean, std):
-        self.mean = torch.tensor(mean, dtype=torch.float32)
-        self.std = torch.tensor(std, dtype=torch.float32)
-
-    def __call__(self, sample):
-        images, labels = sample['images'], sample['labels']
-        images.sub_(self.mean[None, :, None, None]).div_(self.std[None, :, None, None])
-        return {'images': images, 'labels': labels}

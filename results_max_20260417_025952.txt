@@ -1,0 +1,11 @@
+==== GolfDB 4-split sweep ====
+tag: max_20260417_025952
+iterations per split: 8000
+batch=16  seq=64
+start: Fri Apr 17 02:59:52 CDT 2026
+
+---- split 1 train  Fri Apr 17 02:59:52 CDT 2026 ----
+---- split 1 eval  Fri Apr 17 03:35:22 CDT 2026 ----
+split 1 best EMA+TTA PCE = 0.7996
+
+---- split 2 train  Fri Apr 17 03:42:22 CDT 2026 ----

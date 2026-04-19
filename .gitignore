@@ -2,3 +2,18 @@ idea/
 data/videos_160
 *.pkl
 *.tar
+
+# python artifacts
+.venv/
+__pycache__/
+*.pyc
+
+# training outputs
+models_*
+*.log
+split*_clean.txt
+split*_025952.txt
+
+# misc
+.vscode/
+.idea/

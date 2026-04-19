@@ -1,0 +1,30 @@
+==== GolfDB 4-split sweep ====
+tag: max_20260417_125243
+iterations per split: 8000
+batch=16  seq=64
+start: Fri Apr 17 12:52:43 CDT 2026
+
+---- split 1 train  Fri Apr 17 12:52:43 CDT 2026 ----
+---- split 1 eval  Fri Apr 17 13:26:42 CDT 2026 ----
+split 1 best EMA+TTA PCE = 0.7964
+
+---- split 2 train  Fri Apr 17 13:33:48 CDT 2026 ----
+---- split 2 eval  Fri Apr 17 14:08:47 CDT 2026 ----
+split 2 best EMA+TTA PCE = 0.7957
+
+---- split 3 train  Fri Apr 17 14:15:35 CDT 2026 ----
+---- split 3 eval  Fri Apr 17 14:50:37 CDT 2026 ----
+split 3 best EMA+TTA PCE = 0.7868
+
+---- split 4 train  Fri Apr 17 14:57:18 CDT 2026 ----
+---- split 4 eval  Fri Apr 17 15:32:16 CDT 2026 ----
+split 4 best EMA+TTA PCE = 0.7964
+
+==== summary ====
+split 1:  0.7964
+split 2:  0.7957
+split 3:  0.7868
+split 4:  0.7964
+4-split average:  0.793825
+paper baseline:   0.7610
+end: Fri Apr 17 15:39:34 CDT 2026
