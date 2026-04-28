@@ -18,3 +18,19 @@ split*_025952.txt
 # misc
 .vscode/
 .idea/
+# external clones / scratch
+BOBBYBRANCH/
+COWORK/
+
+# poster auxiliaries (keep posters and figures, drop everything else)
+poster/~$*
+poster/*.md
+poster/analyze_preds.py
+poster/generate_poster_figures.py
+poster_best/*.npz
+poster_best/*.roc.png
+
+poster/*.pptx
+poster/*.pdf
+poster/*Copy*
+

@@ -8,9 +8,13 @@ Features:
   - --mode {all, ema, plain} to filter which checkpoints to evaluate
   - --last-n N to only evaluate the tail
   - bf16 autocast by default, --fp16 for fp16
+  - --save-preds writes per-frame probs + preds + labels to a .npz file
+    (one file per checkpoint, named preds_split{N}_{ckpt}.npz in model_dir)
+    Load with: d = np.load(path); probs, preds, labels = d['probs'], d['preds'], d['labels']
 
 Typical use:
   python eval.py models_s1 --split 1 --seq-length 64 --mode ema --tta
+  python eval.py poster_best --split 1 --mode ema --last-n 1 --tta --save-preds
 """
 
 import argparse
@@ -53,7 +57,7 @@ def build_model(lstm_layers, lstm_hidden, lstm_dropout, drop_path):
 @torch.no_grad()
 def evaluate_checkpoint(ckpt_path, split, seq_length, num_workers, vid_dir,
                         lstm_layers, lstm_hidden, lstm_dropout, drop_path,
-                        tta, amp_dtype, model=None, disp=False):
+                        tta, amp_dtype, model=None, disp=False, save_path=None):
     dataset = GolfDB(
         data_file=f'data/val_split_{split}.pkl',
         vid_dir=vid_dir,
@@ -78,7 +82,7 @@ def evaluate_checkpoint(ckpt_path, split, seq_length, num_workers, vid_dir,
     model.eval()
 
     correct = []
-    all_preds, all_labels = [], []
+    all_probs, all_preds, all_labels = [], [], []
 
     for idx, sample in enumerate(tqdm(data_loader, desc=os.path.basename(ckpt_path), leave=False)):
         images, labels = sample['images'], sample['labels']
@@ -111,12 +115,23 @@ def evaluate_checkpoint(ckpt_path, split, seq_length, num_workers, vid_dir,
 
         frame_preds = np.argmax(probs, axis=1)
         frame_labels = labels.squeeze().numpy()
+        all_probs.append(probs)
         all_preds.extend(frame_preds.tolist())
         all_labels.extend(frame_labels.tolist())
 
     pce = np.mean(correct)
     accuracy = accuracy_score(all_labels, all_preds)
     macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+
+    if save_path is not None:
+        np.savez_compressed(
+            save_path,
+            probs=np.concatenate(all_probs, axis=0),
+            preds=np.array(all_preds, dtype=np.int32),
+            labels=np.array(all_labels, dtype=np.int32),
+        )
+        print(f'  Saved preds → {save_path}')
+
     return pce, accuracy, macro_f1
 
 
@@ -157,6 +172,8 @@ def main():
     parser.add_argument('--last-n', type=int, default=0,
                         help='After filtering, keep only the last N checkpoints (0 = keep all)')
     parser.add_argument('--fp16', action='store_true', help='Use fp16 autocast instead of default bf16')
+    parser.add_argument('--save-preds', action='store_true',
+                        help='Save per-frame probs/preds/labels to a .npz file in model_dir')
     args = parser.parse_args()
 
     checkpoints = select_checkpoints(args.model_dir, args.mode, args.last_n)
@@ -178,12 +195,19 @@ def main():
     results = []
 
     for ckpt_path in checkpoints:
+        if args.save_preds:
+            ckpt_stem = os.path.splitext(os.path.basename(ckpt_path))[0].replace('.pth', '')
+            save_path = os.path.join(args.model_dir, f'preds_split{args.split}_{ckpt_stem}.npz')
+        else:
+            save_path = None
+
         pce, acc, f1 = evaluate_checkpoint(
             ckpt_path, split=args.split, seq_length=args.seq_length,
             num_workers=args.num_workers, vid_dir=args.vid_dir,
             lstm_layers=args.lstm_layers, lstm_hidden=args.lstm_hidden,
             lstm_dropout=args.lstm_dropout, drop_path=args.drop_path,
             tta=args.tta, amp_dtype=amp_dtype, model=model, disp=False,
+            save_path=save_path,
         )
         ckpt_name = os.path.basename(ckpt_path)
         print(f'{ckpt_name}: PCE = {pce:.4f}  Accuracy = {acc:.4f}  Macro F1 = {f1:.4f}')
